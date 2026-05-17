@@ -1,0 +1,31 @@
+---
+title: Changelog
+description: Release history for all SignaKit SDKs. All SDKs share a unified version number.
+---
+
+# Changelog
+
+All SignaKit SDKs share a unified version number — a version like `v0.1.0` applies to the entire platform simultaneously. This changelog covers SDK releases, breaking changes, and significant feature additions. Subscribe to the [GitHub repository](https://github.com/signakit) to be notified of new releases.
+
+## v0.1.0 — April 1, 2026
+
+Initial public release across all 10 SDKs:
+
+- **Local evaluation model** — flag config fetched once from CloudFront CDN; all `decide()` calls run in-process with no network round-trip
+- **Core flag features** — boolean gates, multi-variation flags, feature variables (string, number, boolean, JSON)
+- **A/B testing and multi-armed bandit** — fixed-split experiments and adaptive traffic allocation with automatic exposure tracking
+- **Audience targeting** — reusable user segments with attribute-based rules (equals, not_equals, contains, greater_than, less_than)
+- **Environment support** — separate development, staging, and production environments with independent SDK keys
+
+| SDK | Package | Registry |
+|---|---|---|
+| Node.js | `@signakit/flags-node` | npm |
+| Browser | `@signakit/flags-browser` | npm |
+| React | `@signakit/flags-react` | npm |
+| React Native | `@signakit/flags-react-native` | npm |
+| Flutter | `signakit_flags` | pub.dev |
+| Python | `signakit-flags` | PyPI |
+| Go | `github.com/signakit/flags-golang` | Go modules |
+| Java | `com.signakit:flags-java` | Maven Central |
+| PHP | `signakit/flags-php` | Packagist |
+| Laravel | `signakit/flags-laravel` | Packagist |

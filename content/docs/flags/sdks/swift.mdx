@@ -1,0 +1,573 @@
+---
+title: Swift
+description: Full API reference for SignaKitFlags — local-evaluation feature flags for iOS, macOS, tvOS, and watchOS with async/await and Swift concurrency.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout'
+import { Steps, Step } from 'fumadocs-ui/components/steps'
+
+# Swift SDK
+
+**Package:** `SignaKitFlags`  
+**Registry:** Swift Package Manager  
+**Requirements:** Swift 5.9+, iOS 16+ / macOS 13+ / tvOS 16+ / watchOS 9+
+
+The Swift SDK fetches your flag configuration from the SignaKit CDN once on startup, then evaluates all flags **locally** on each call — no network round-trip per evaluation. Exposure and conversion events are sent asynchronously and never block the main thread.
+
+---
+
+## Installation
+
+<Steps>
+<Step>
+
+### Add the package in Xcode
+
+Open your project in Xcode and go to **File → Add Package Dependencies**. Enter the repository URL:
+
+```
+https://github.com/signakit/flags-swift
+```
+
+Select **Up to Next Major Version** starting from `1.0.0`, then click **Add Package**.
+
+</Step>
+<Step>
+
+### Or add it to Package.swift
+
+```swift
+dependencies: [
+  .package(url: "https://github.com/signakit/flags-swift", from: "1.0.0"),
+],
+targets: [
+  .target(
+    name: "YourTarget",
+    dependencies: [
+      .product(name: "SignaKitFlags", package: "flags-swift"),
+    ]
+  ),
+]
+```
+
+</Step>
+<Step>
+
+### Import the module
+
+```swift
+import SignaKitFlags
+```
+
+</Step>
+</Steps>
+
+---
+
+## Initialization
+
+Create the client **once** — typically in your `App` struct, a shared service, or an environment object. A singleton reuses the fetched config for the process lifetime and prevents redundant network fetches.
+
+```swift title="SignaKitService.swift"
+import SignaKitFlags
+
+final class SignaKitService: ObservableObject {
+    static let shared = SignaKitService()
+
+    let client: SignaKitClient?
+
+    private init() {
+        client = SignaKit.createInstance(config: .init(
+            sdkKey: "sk_dev_yourOrgId_yourProjectId_random"
+        ))
+    }
+}
+```
+
+Or for SwiftUI apps, store it in the environment:
+
+```swift title="MyApp.swift"
+import SwiftUI
+import SignaKitFlags
+
+@main
+struct MyApp: App {
+    let signakit = SignaKit.createInstance(config: .init(
+        sdkKey: "sk_dev_yourOrgId_yourProjectId_random"
+    ))
+
+    var body: some Scene {
+        WindowGroup {
+            ContentView()
+                .task {
+                    _ = await signakit?.onReady()
+                }
+        }
+    }
+}
+```
+
+<Callout type="danger" title="Anti-pattern: client per view">
+
+```swift
+// ❌ Never do this — fetches config on every view init
+struct ProductView: View {
+    var body: some View {
+        let client = SignaKit.createInstance(config: .init(sdkKey: "..."))
+        // ...
+    }
+}
+```
+
+Create the client once and share the instance via an environment object, singleton, or dependency injection.
+
+</Callout>
+
+### `SignaKit.createInstance(config:)`
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `sdkKey` | `String` | required | Your SignaKit SDK key (`sk_dev_…` or `sk_prod_…`) |
+| `pollingInterval` | `TimeInterval` | `30` | How often (in seconds) to re-fetch config from the CDN. Uses ETags so no-op polls are lightweight. Set to `0` to disable. |
+
+Returns `SignaKitClient?` — `nil` if the SDK key format is invalid.
+
+---
+
+## Waiting for the client to be ready
+
+Call `onReady()` before evaluating flags. It resolves once the initial config has been fetched from the CDN.
+
+```swift
+let result = await client.onReady()
+
+if !result.success {
+    print("SignaKit failed to load config: \(result.reason ?? "unknown")")
+    // decide() returns nil when not ready — treat as disabled/control
+}
+```
+
+In SwiftUI, use `.task` on your root view to await readiness before the first render:
+
+```swift
+struct RootView: View {
+    @StateObject private var service = SignaKitService.shared
+
+    var body: some View {
+        ContentView()
+            .task {
+                guard let client = service.client else { return }
+                let result = await client.onReady()
+                if !result.success {
+                    print("[SignaKit] Not ready: \(result.reason ?? "unknown")")
+                }
+            }
+    }
+}
+```
+
+### `onReady()` return value — `OnReadyResult`
+
+| Field | Type | Description |
+|---|---|---|
+| `success` | `Bool` | `true` when config was fetched successfully |
+| `reason` | `String?` | Human-readable error message when `success` is `false` |
+
+`onReady()` never throws. On failure it resolves with `success: false` and a `reason` string. After a failed initialization, `createUserContext()` returns `nil` — safe to call without guarding.
+
+---
+
+## Creating a user context
+
+A `SignaKitUserContext` represents a specific user. Create one per user session with the user's ID and any attributes you want to use in targeting rules.
+
+Because the config is stored in an actor, `createUserContext` is `async`:
+
+```swift
+guard let userContext = await client.createUserContext(
+    "user-123",
+    attributes: [
+        "plan":    .string("pro"),
+        "country": .string("US"),
+        "age":     .number(28),
+        "beta":    .boolean(true),
+    ]
+) else {
+    // client not ready — decide() would return nil anyway
+    return
+}
+```
+
+### `createUserContext(_:attributes:)`
+
+| Parameter | Type | Description |
+|---|---|---|
+| `userId` | `String` | Unique, stable identifier for the user. Used for deterministic bucketing — the same ID always produces the same variation for the same flag configuration. |
+| `attributes` | `UserAttributes` (`[String: AttributeValue]`) | Key-value pairs matched against your audience targeting rules. Defaults to `[:]`. |
+
+**Returns** `SignaKitUserContext?` — `nil` if the client is not yet ready (i.e., `onReady()` has not resolved with `success: true`).
+
+<Callout type="info">
+
+**`$userAgent` attribute** — pass the user-agent string as `"$userAgent"` to enable bot detection. When a bot is detected, all flags return `enabled: false` with `variationKey: "off"`, and no events are fired.
+
+```swift
+let userContext = await client.createUserContext(
+    userId,
+    attributes: [
+        "$userAgent": .string(userAgentString),
+        "plan": .string("pro"),
+    ]
+)
+```
+
+The `$userAgent` key is stripped from `userContext.attributes` after bot detection runs — it will not appear in targeting rules or event payloads.
+
+</Callout>
+
+### `AttributeValue`
+
+User attributes use the `AttributeValue` enum so the compiler enforces type safety:
+
+| Case | Swift type | Example |
+|---|---|---|
+| `.string(String)` | `String` | `.string("premium")` |
+| `.number(Double)` | `Double` | `.number(28)` |
+| `.boolean(Bool)` | `Bool` | `.boolean(true)` |
+| `.strings([String])` | `[String]` | `.strings(["US", "CA"])` |
+
+---
+
+## Evaluating a single flag
+
+`decide()` is synchronous — the config is already in memory after `onReady()` resolves.
+
+```swift
+let decision = userContext.decide("new-checkout")
+
+if decision?.enabled == true {
+    // Show the new checkout experience
+    print(decision!.variationKey) // e.g. "treatment"
+}
+```
+
+### `decide(_:)` return value — `SignaKitDecision?`
+
+Returns a `SignaKitDecision`, or `nil` if the flag does not exist or is archived.
+
+| Field | Type | Description |
+|---|---|---|
+| `flagKey` | `String` | The flag key you passed in |
+| `enabled` | `Bool` | Whether the flag is on for this user |
+| `variationKey` | `String` | Which variation the user is in (`"control"`, `"treatment"`, or your custom key) |
+| `ruleKey` | `String?` | The targeting rule that matched, or `nil` for default/disabled paths |
+| `ruleType` | `RuleType?` | `.abTest`, `.multiArmedBandit`, or `.targeted`. `nil` for default/disabled paths. |
+| `variables` | `[String: VariableValue]` | Resolved variable values for the matched variation |
+
+Always optional-chain the return value. A `nil` result means the flag was not found — treat it as disabled/control:
+
+```swift
+let showFeature = userContext.decide("my-flag")?.enabled ?? false
+```
+
+---
+
+## Evaluating all flags at once
+
+```swift
+let decisions = userContext.decideAll()
+
+if decisions["new-sidebar"]?.enabled == true {
+    // show new sidebar
+}
+if decisions["beta-analytics"]?.enabled == true {
+    // show beta analytics
+}
+```
+
+### `decideAll()` return value — `SignaKitDecisions`
+
+`SignaKitDecisions` is a `typealias` for `[String: SignaKitDecision]`. Archived flags are excluded. Returns an empty dictionary when the client is not ready.
+
+<Callout type="warning" title="Use decideAll() selectively">
+`decideAll()` evaluates every flag in your project and fires an `$exposure` event for each one the user is bucketed into. Only call it when you genuinely need all flags at once — for example, on app launch to pre-fetch decisions for the session. Calling it on every view render is one of the most common causes of unexpected event volume spikes.
+</Callout>
+
+---
+
+## Tracking events
+
+Track a conversion or goal event that you have defined in the SignaKit dashboard.
+
+```swift
+await userContext.trackEvent("purchase_completed", options: .init(
+    value: 99.99,
+    metadata: ["plan": .string("pro"), "itemCount": .number(3)]
+))
+```
+
+### `trackEvent(_:options:)`
+
+| Parameter | Type | Description |
+|---|---|---|
+| `eventKey` | `String` | The event name, matching an event definition in your project |
+| `options` | `TrackEventOptions` | Optional value and metadata |
+
+**`TrackEventOptions`**
+
+| Field | Type | Description |
+|---|---|---|
+| `value` | `Double?` | Optional numeric value (e.g., purchase amount, duration) |
+| `metadata` | `[String: JSONValue]?` | Optional metadata sent with the event. Silently dropped if serialized size exceeds 5 KB. |
+
+**Returns** `async` — fire and forget. Errors are caught internally and never propagate to your code.
+
+The event is automatically annotated with the flag decisions the user has already been exposed to, so experiment attribution works without extra configuration.
+
+```swift
+// Inside a button action
+Button("Place Order") {
+    Task {
+        await processOrder(cart)
+        await userContext.trackEvent("order_placed", options: .init(
+            value: cart.total,
+            metadata: ["itemCount": .number(Double(cart.items.count))]
+        ))
+    }
+}
+```
+
+### `JSONValue` (metadata values)
+
+Event metadata uses the `JSONValue` enum:
+
+| Case | Description |
+|---|---|
+| `.string(String)` | String value |
+| `.number(Double)` | Numeric value |
+| `.bool(Bool)` | Boolean value |
+| `.null` | JSON null |
+| `.array([JSONValue])` | Array of JSON values |
+| `.object([String: JSONValue])` | Nested JSON object |
+
+---
+
+## Swift types
+
+```swift
+import SignaKitFlags
+
+// Entry point
+let client: SignaKitClient? = SignaKit.createInstance(config: .init(sdkKey: "sk_dev_…"))
+
+// Ready check
+let result: OnReadyResult = await client.onReady()
+// result.success — Bool
+// result.reason  — String?
+
+// User context (async because config is actor-isolated)
+let userContext: SignaKitUserContext? = await client.createUserContext(
+    "user-123",
+    attributes: ["plan": .string("pro")]
+)
+
+// Single flag evaluation (sync)
+let decision: SignaKitDecision? = userContext.decide("flag-key")
+
+// All flags (sync)
+let decisions: SignaKitDecisions = userContext.decideAll()  // [String: SignaKitDecision]
+
+// Variable values
+let title: VariableValue? = decision?.variables["title"]
+if case .string(let s) = title { print(s) }
+if case .number(let n) = title { print(n) }
+if case .boolean(let b) = title { print(b) }
+
+// Rule type enum
+switch decision?.ruleType {
+case .abTest:           print("A/B test")
+case .multiArmedBandit: print("MAB")
+case .targeted:         print("Targeted rollout")
+case nil:               print("Default / disabled")
+}
+
+// Event tracking (async)
+await userContext.trackEvent("purchase_completed", options: .init(
+    value: 99.99,
+    metadata: ["sku": .string("prod-123")]
+))
+
+// Cleanup (cancels background polling)
+await client.destroy()
+```
+
+---
+
+## A/B testing
+
+When a flag is running as an experiment, `decide()` returns the assigned variation. The SDK automatically fires an `$exposure` event (asynchronously) the first time the user is evaluated for that flag.
+
+```swift
+let checkout = userContext.decide("checkout-redesign")
+
+switch checkout?.variationKey {
+case "treatment-a":
+    CheckoutV2()
+case "treatment-b":
+    CheckoutV3()
+default:
+    LegacyCheckout() // "control", nil (flag off), or not targeted
+}
+```
+
+Track your primary metric when the user converts:
+
+```swift
+await userContext.trackEvent("purchase_completed", options: .init(value: order.total))
+```
+
+---
+
+## Targeted delivery
+
+When a flag is configured as a targeted rollout (not an experiment), `decide()` returns `enabled: true` for users who match the audience rule. No primary metric is needed.
+
+```swift
+let betaAccess = userContext.decide("beta-dashboard")
+
+if betaAccess?.enabled == true {
+    // Navigate to beta experience
+    navigationPath.append(.betaDashboard)
+}
+```
+
+Bucketing is deterministic — the same `userId` always produces the same result for the same flag configuration.
+
+---
+
+## Flag variables
+
+Variables let you attach typed values to each variation without shipping separate code paths. Read them from `decision.variables`:
+
+```swift
+let decision = userContext.decide("banner-config")
+
+if let titleValue = decision?.variables["title"],
+   case .string(let title) = titleValue {
+    bannerLabel.text = title
+}
+
+if let countValue = decision?.variables["maxItems"],
+   case .number(let max) = countValue {
+    collectionView.prefetchItemCount = Int(max)
+}
+```
+
+Variable values are resolved by merging flag-level defaults with any variation-specific overrides — your code always gets a value even if the variation doesn't override every key.
+
+---
+
+## SwiftUI integration
+
+A typical pattern for SwiftUI apps is to create the client once in `@main`, await readiness in a root `.task`, then share the resolved user context through the environment.
+
+```swift title="MyApp.swift"
+import SwiftUI
+import SignaKitFlags
+
+@main
+struct MyApp: App {
+    @StateObject private var flags = FlagsModel()
+
+    var body: some Scene {
+        WindowGroup {
+            Group {
+                if flags.isReady {
+                    ContentView(flags: flags)
+                } else {
+                    ProgressView()
+                }
+            }
+            .task { await flags.load(userId: Auth.shared.userId) }
+        }
+    }
+}
+
+@MainActor
+final class FlagsModel: ObservableObject {
+    @Published var isReady = false
+    private(set) var userContext: SignaKitUserContext?
+
+    private let client = SignaKit.createInstance(config: .init(
+        sdkKey: "sk_dev_yourOrgId_yourProjectId_random"
+    ))
+
+    func load(userId: String) async {
+        guard let client else { return }
+        let result = await client.onReady()
+        guard result.success else { return }
+        userContext = await client.createUserContext(userId)
+        isReady = true
+    }
+
+    func reload(userId: String) async {
+        guard let client else { return }
+        userContext = await client.createUserContext(userId)
+        isReady = true
+    }
+}
+```
+
+Then in any view:
+
+```swift
+struct CheckoutView: View {
+    let flags: FlagsModel
+
+    var body: some View {
+        let decision = flags.userContext?.decide("checkout-redesign")
+
+        if decision?.variationKey == "treatment" {
+            NewCheckoutView()
+        } else {
+            LegacyCheckoutView()
+        }
+    }
+}
+```
+
+<Callout type="info">
+Call `flags.reload(userId:)` after a user signs in or out to re-evaluate flags with the new identity.
+</Callout>
+
+---
+
+## Anti-patterns
+
+| Pattern | Problem | Fix |
+|---|---|---|
+| Creating `SignaKitClient` inside a `View` or `build()` method | Fetches config on every render; each instance has its own dedup state so every render fires fresh exposure events | Create the client once — use a singleton, `@StateObject`, or environment object |
+| Not awaiting `onReady()` before `createUserContext` | `createUserContext` returns `nil` when the client is not ready | Await `onReady()` first, or guard on the return value |
+| Calling `decideAll()` on every view update | Evaluates every flag and fires `$exposure` events on every rebuild | Call `decideAll()` once per session (e.g., in `.task` on the root view) and cache the result |
+| Ignoring `nil` decisions without a fallback | Silent crashes or inconsistent UI when flags are off or the client isn't ready | Always use `?.enabled ?? false` or `?? defaultValue` |
+| Hardcoding the SDK key as a string literal in source | Leaks credentials into version control | Store in `xcconfig`, a secrets manager, or `Info.plist` loaded at runtime |
+
+---
+
+## Cleanup
+
+Call `destroy()` when the client is no longer needed to cancel the background polling task and release resources. In most long-lived app contexts this is unnecessary, but it is important in tests or short-lived services.
+
+```swift
+await client.destroy()
+```
+
+---
+
+## Related
+
+- [Quickstart →](/docs/flags/quickstart)
+- [React Native SDK →](/docs/flags/sdks/react-native)
+- [Flutter SDK →](/docs/flags/sdks/flutter)
+- [Concepts: A/B Testing →](/docs/flags/concepts/ab-testing)
+- [Concepts: Targeted Delivery →](/docs/flags/concepts/targeted-delivery)

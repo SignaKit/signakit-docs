@@ -1,0 +1,317 @@
+---
+title: Next.js App Router
+description: Integrate SignaKit feature flags into a Next.js App Router application — evaluate flags in server components, pass results to client components, and track conversions.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout'
+import { Steps, Step } from 'fumadocs-ui/components/steps'
+
+# Next.js App Router
+
+**SDK:** `@signakit/flags-node`
+**Next.js version:** 14+ (App Router)
+
+The recommended pattern for Next.js App Router is to evaluate flags in **server components**, then pass the result as a prop to any client components that need it. This keeps flag evaluation on the server — zero client bundle cost, no hydration mismatch, no loading state.
+
+<Callout type="info" title="Version compatibility">
+This guide is written for **Next.js v15 and v16** (Turbopack). If you are on **v14**, two things differ:
+
+- **Import:** Use `@signakit/flags-node` (base import) instead of `@signakit/flags-node/next`. The `/next` subpath relies on `after()` from `next/server`, which does not exist in v14. The base import works fine — exposure events are fire-and-forget, which is reliable with webpack (v14's bundler).
+- **`instrumentation.ts`:** Requires an opt-in flag in `next.config.ts`: `experimental: { instrumentationHook: true }`.
+
+The `globalThis` singleton pattern, `await signakitReady`, and all flag evaluation code are identical across all versions.
+</Callout>
+
+---
+
+## Setup
+
+<Steps>
+
+<Step>
+
+### Install the SDK
+
+```npm
+npm install @signakit/flags-node
+```
+
+Add your SDK key to `.env.local`:
+
+```bash
+SIGNAKIT_SDK_KEY=sk_dev_yourOrgId_yourProjectId_random
+```
+
+</Step>
+
+<Step>
+
+### Create a module-level singleton
+
+Use the `/next` subpath so exposure events are scheduled with Next.js's `after()` — sent after the response is flushed rather than aborted by the request lifecycle. The `globalThis` guard prevents Turbopack from discarding the pre-warmed client when it re-evaluates the module on requests.
+
+```ts title="lib/signakit.ts"
+import { createInstance } from '@signakit/flags-node/next'
+import type { SignaKitClient } from '@signakit/flags-node'
+
+const globalForSignaKit = globalThis as unknown as {
+  signakit: SignaKitClient
+  signakitReady: Promise<{ success: boolean; reason?: string }>
+}
+
+if (!globalForSignaKit.signakit) {
+  const client = createInstance({
+    sdkKey: process.env.SIGNAKIT_SDK_KEY!,
+  })
+
+  if (!client) {
+    throw new Error('[SignaKit] Failed to create client — check your SIGNAKIT_SDK_KEY')
+  }
+
+  globalForSignaKit.signakit = client
+  globalForSignaKit.signakitReady = client.onReady()
+}
+
+export const signakit = globalForSignaKit.signakit
+export const signakitReady = globalForSignaKit.signakitReady
+```
+
+<Callout type="danger" title="Do not add 'use server' to this file">
+`'use server'` marks every export as a server action — which must be an `async function`. Exporting a class instance (`signakit`) or a `Promise` (`signakitReady`) from a `'use server'` file is invalid and Next.js will throw an error. This file should have no directive at all. Server components import from it freely since they are already server-side.
+</Callout>
+
+</Step>
+
+<Step>
+
+### Pre-warm the client with instrumentation
+
+Next.js's `after()` handles exposure events post-response, but the config fetch itself must also complete outside any request's async context — otherwise Turbopack's dev server can abort it during cold start. `instrumentation.ts` runs once before any requests arrive, making it the right place to warm the client.
+
+```ts title="instrumentation.ts"
+export async function register() {
+  if (process.env.NEXT_RUNTIME === 'nodejs') {
+    const { signakitReady } = await import('./lib/signakit')
+    await signakitReady
+  }
+}
+```
+
+Place `instrumentation.ts` at the project root (same level as `package.json`). The `NEXT_RUNTIME === 'nodejs'` guard ensures it only runs in the Node.js runtime, not the Edge runtime used by `proxy.ts`.
+
+<Callout type="info" title="Next.js v14: opt in to instrumentation">
+`instrumentation.ts` is stable in v15+. On v14, add this to your `next.config.ts` to enable it:
+
+```ts title="next.config.ts"
+const nextConfig = {
+  experimental: {
+    instrumentationHook: true,
+  },
+}
+export default nextConfig
+```
+</Callout>
+
+</Step>
+
+<Step>
+
+### Read the visitor ID cookie
+
+SignaKit uses `userId` as the bucketing key — the same ID always produces the same variation. For anonymous visitors, read a stable `visitor_id` cookie. For authenticated users, use your auth session's user ID.
+
+```ts title="lib/visitor.ts"
+import { cookies } from 'next/headers'
+import { cache } from 'react'
+
+export const getVisitorId = cache(async (): Promise<string> => {
+  const cookieStore = await cookies()
+  return cookieStore.get('visitor_id')?.value ?? 'anonymous'
+})
+```
+
+`cache()` ensures `getVisitorId()` is called at most once per request even if multiple server components call it.
+
+</Step>
+
+</Steps>
+
+---
+
+## Evaluating a flag in a server component
+
+```ts title="app/checkout/page.tsx"
+import { signakit, signakitReady } from '@/lib/signakit'
+import { getVisitorId } from '@/lib/visitor'
+import { CheckoutV2 } from './checkout-v2'
+import { LegacyCheckout } from './checkout-legacy'
+
+export default async function CheckoutPage() {
+  await signakitReady
+
+  const visitorId = await getVisitorId()
+  const userCtx = signakit.createUserContext(visitorId)
+  const checkout = userCtx?.decide('checkout-redesign')
+
+  return checkout?.variationKey === 'treatment'
+    ? <CheckoutV2 />
+    : <LegacyCheckout />
+}
+```
+
+<Callout type="info">
+**With auth session attributes** — if you have a session, pass its data as attributes for more precise targeting:
+
+```typescript
+const session = await auth()
+const userCtx = signakit.createUserContext(session?.user.id ?? visitorId, {
+  plan: session?.user.plan ?? 'free',
+})
+// userCtx is SignaKitUserContext | null — use optional chaining
+const decision = userCtx?.decide('my-flag')
+```
+</Callout>
+
+---
+
+## Passing flag results to client components
+
+When a client component needs to act on a flag result, evaluate on the server and pass as a prop.
+
+```ts title="app/dashboard/page.tsx" 
+import { signakit, signakitReady } from '@/lib/signakit'
+import { getVisitorId } from '@/lib/visitor'
+import { DashboardHeader } from './dashboard-header' // 'use client'
+
+export default async function DashboardPage() {
+  await signakitReady
+  const visitorId = await getVisitorId()
+  const userCtx = signakit.createUserContext(visitorId)
+  const newNav = userCtx?.decide('redesigned-nav')
+
+  return (
+    <main>
+      <DashboardHeader showNewNav={newNav?.enabled ?? false} />
+    </main>
+  )
+}
+```
+
+```ts title="app/dashboard/dashboard-header.tsx"
+'use client'
+
+export function DashboardHeader({ showNewNav }: { showNewNav: boolean }) {
+  return showNewNav ? <NewNav /> : <LegacyNav />
+}
+```
+
+<Callout type="danger" title="Never evaluate flags inside a client component">
+```typescript
+// ❌ Requires bundling the server SDK client-side — won't work
+'use client'
+
+import { signakit } from '@/lib/signakit'
+
+export function BadComponent() {
+  const decision = signakit.createUserContext('user-123').decide('my-flag') // ❌
+}
+```
+
+Evaluate in a server component and pass the boolean as a prop.
+</Callout>
+
+---
+
+## Tracking conversion events
+
+Track conversions from client components via a server action, keeping the SDK key server-side.
+
+```ts title="app/actions.ts" 
+'use server'
+
+import { signakit } from '@/lib/signakit'
+import { getVisitorId } from '@/lib/visitor'
+
+export async function trackPurchase(amount: number) {
+  const visitorId = await getVisitorId()
+  const userCtx = signakit.createUserContext(visitorId)
+  await userCtx?.trackEvent('purchase_completed', { value: amount })
+}
+```
+
+```ts title="app/checkout/purchase-button.tsx"
+'use client'
+
+import { trackPurchase } from '@/app/actions'
+
+export function PurchaseButton({ amount }: { amount: number }) {
+  return (
+    <button onClick={() => trackPurchase(amount)}>
+      Complete purchase
+    </button>
+  )
+}
+```
+
+---
+
+## Middleware — route-level flag gating
+
+Use middleware to rewrite or redirect based on a flag before the page renders.
+
+```ts title="proxy.ts"
+// Next.js 16 uses proxy.ts instead of middleware.ts
+import { NextResponse } from 'next/server'
+import { signakit, signakitReady } from '@/lib/signakit'
+import type { NextRequest } from 'next/server'
+
+export async function middleware(request: NextRequest) {
+  await signakitReady
+  const visitorId = request.cookies.get('visitor_id')?.value ?? 'anonymous'
+  const userCtx = signakit.createUserContext(visitorId)
+  const homepage = userCtx?.decide('homepage-redesign')
+
+  if (request.nextUrl.pathname === '/' && homepage?.variationKey === 'treatment') {
+    return NextResponse.rewrite(new URL('/homepage-v2', request.url))
+  }
+
+  return NextResponse.next()
+}
+
+export const config = {
+  matcher: ['/'], // ← limit to routes that actually need the flag
+}
+```
+
+<Callout type="warning" title="Middleware runs on every matched request — keep the matcher narrow">
+Use `decide('specific-flag')` in middleware, never `decideAll()`. Set a tight `matcher` so the middleware only runs on routes that need it.
+</Callout>
+
+<Callout type="info" title="proxy.ts in Next.js 16">
+Next.js 16 uses `proxy.ts` at the project root instead of `middleware.ts`. The API is identical — only the filename changed.
+</Callout>
+
+---
+
+## Anti-patterns
+
+| Pattern | Problem | Fix |
+|---|---|---|
+| `'use server'` at the top of `lib/signakit.ts` | Marks every export as a server action — class instances and Promises are not valid server action exports; Next.js throws at startup | Remove the directive entirely; server components are already server-side |
+| `createInstance()` inside `page.tsx` | Re-fetches config on every request; loses per-instance dedup | Create the client once in `lib/signakit.ts` |
+| No `globalThis` guard in `lib/signakit.ts` | Turbopack re-evaluates modules on requests, creating a fresh uninitialized client each time | Wrap `createInstance` in the `globalThis` guard shown in the setup step |
+| No `instrumentation.ts` | Config fetch runs inside the first request's async context and can be aborted before it completes | Add `instrumentation.ts` to pre-warm the client before any requests arrive |
+| Importing from `@signakit/flags-node` instead of `@signakit/flags-node/next` | Exposure events are fire-and-forget within the request and aborted when the response is sent | Use `@signakit/flags-node/next` — it wraps sends with `after()` automatically |
+| `decide()` inside a `'use client'` component | Requires bundling the server SDK client-side | Evaluate in the server component, pass result as prop |
+| `decideAll()` in `proxy.ts` | Evaluates every flag on every request | Use `decide('specific-flag')` with a narrow `matcher` |
+| Not awaiting `signakitReady` | `decide()` returns `null` if config hasn't loaded yet | `await signakitReady` at the top of every evaluating server component and middleware function |
+| Not using optional chaining on `createUserContext()` | Returns `null` if the client isn't ready — calling `.decide()` directly throws | Use `userCtx?.decide(...)` or check for null |
+
+---
+
+## Related
+
+- [Node.js SDK reference →](/flags/sdks/node)
+- [Next.js Pages Router guide →](/flags/guides/nextjs-pages-router)
+- [Next.js Middleware guide →](/flags/guides/nextjs-middleware)
+- [Concepts: A/B Testing →](/flags/concepts/ab-testing)
