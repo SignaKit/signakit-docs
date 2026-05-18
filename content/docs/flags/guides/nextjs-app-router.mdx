@@ -229,10 +229,11 @@ Track conversions from client components via a server action, keeping the SDK ke
 ```ts title="app/actions.ts" 
 'use server'
 
-import { signakit } from '@/lib/signakit'
+import { signakitReady, signakit } from '@/lib/signakit'
 import { getVisitorId } from '@/lib/visitor'
 
 export async function trackPurchase(amount: number) {
+  await signakitReady
   const visitorId = await getVisitorId()
   const userCtx = signakit.createUserContext(visitorId)
   await userCtx?.trackEvent('purchase_completed', { value: amount })
@@ -252,44 +253,6 @@ export function PurchaseButton({ amount }: { amount: number }) {
   )
 }
 ```
-
----
-
-## Middleware — route-level flag gating
-
-Use middleware to rewrite or redirect based on a flag before the page renders.
-
-```ts title="proxy.ts"
-// Next.js 16 uses proxy.ts instead of middleware.ts
-import { NextResponse } from 'next/server'
-import { signakit, signakitReady } from '@/lib/signakit'
-import type { NextRequest } from 'next/server'
-
-export async function middleware(request: NextRequest) {
-  await signakitReady
-  const visitorId = request.cookies.get('visitor_id')?.value ?? 'anonymous'
-  const userCtx = signakit.createUserContext(visitorId)
-  const homepage = userCtx?.decide('homepage-redesign')
-
-  if (request.nextUrl.pathname === '/' && homepage?.variationKey === 'treatment') {
-    return NextResponse.rewrite(new URL('/homepage-v2', request.url))
-  }
-
-  return NextResponse.next()
-}
-
-export const config = {
-  matcher: ['/'], // ← limit to routes that actually need the flag
-}
-```
-
-<Callout type="warning" title="Middleware runs on every matched request — keep the matcher narrow">
-Use `decide('specific-flag')` in middleware, never `decideAll()`. Set a tight `matcher` so the middleware only runs on routes that need it.
-</Callout>
-
-<Callout type="info" title="proxy.ts in Next.js 16">
-Next.js 16 uses `proxy.ts` at the project root instead of `middleware.ts`. The API is identical — only the filename changed.
-</Callout>
 
 ---
 
@@ -313,5 +276,4 @@ Next.js 16 uses `proxy.ts` at the project root instead of `middleware.ts`. The A
 
 - [Node.js SDK reference →](/flags/sdks/node)
 - [Next.js Pages Router guide →](/flags/guides/nextjs-pages-router)
-- [Next.js Middleware guide →](/flags/guides/nextjs-middleware)
 - [Concepts: A/B Testing →](/flags/concepts/ab-testing)
